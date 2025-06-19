@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+"""Kivy front‑end for 5×5 Tic‑Tac‑Toe (with obstacles).
+
+Upgrades implemented in this revision
+-------------------------------------
+1. **UI components separated**  
+   * `GameCell`  – a single button with row/col metadata.
+   * `GameGrid`  – owns the GridLayout; provides `reset()` and
+     `update_cell()` so the layout delegate (presenter) never touches
+     internal widgets.
+2. **Constructor‑based dependency injection**  
+   * `TicTacToeLayout` receives an *already‑constructed* `GameController`.
+   * A factory helper `create_game()` wires `Board → GameController → View`.
+"""
+
+from typing import Dict, Tuple
+
 from kivy.app import App
-from kivy.uix.gridlayout import GridLayout
 from kivy.uix.button import Button
+from kivy.uix.gridlayout import GridLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.properties import StringProperty
@@ -11,157 +27,174 @@ from kivy.clock import Clock
 from board import Board
 from controller import GameController, GameObserver, GameState
 
+# -----------------------------------------------------------------------------
+# UI COMPONENTS (encapsulated)
+# -----------------------------------------------------------------------------
 
-class CellButton(Button):
-    """A single cell that remembers its board coordinates."""
+class GameCell(Button):
+    """Single grid cell that knows its own coordinates."""
 
-    coords: tuple[int, int] | None = None
+    def __init__(self, row: int, col: int, **kw):
+        super().__init__(**kw)
+        self._row = row
+        self._col = col
+
+    # expose coordinates as read‑only properties
+    @property
+    def coords(self) -> Tuple[int, int]:
+        return self._row, self._col
 
 
-class TicTacToeLayout(BoxLayout):  # implements GameObserver structurally
-    """Kivy UI layer for the Tic‑Tac‑Toe game."""
+class GameGrid(GridLayout):
+    """Widget that owns the full board of `GameCell`s.
 
-    # initial status so the label has something to render on the first frame
+    Public API intentionally small:
+        * `reset(board: Board)`   – repaint whole board after model reset.
+        * `update_cell(coords, symbol)` – paint an X/O and disable that cell.
+    """
+
+    def __init__(self, board: Board, on_cell_press, **kw):
+        super().__init__(rows=board.rows, cols=board.cols, spacing=2, padding=2, **kw)
+        self._cells: Dict[Tuple[int, int], GameCell] = {}
+        self._build_cells(board, on_cell_press)
+
+    # ------------------------------------------------------------------
+    # public helpers
+    # ------------------------------------------------------------------
+
+    def reset(self, board: Board):
+        for (i, j), cell in self._cells.items():
+            if board.is_obstacle(i, j):
+                self._paint_obstacle(cell)
+            else:
+                self._paint_blank(cell)
+
+    def update_cell(self, coords: Tuple[int, int], symbol: str):
+        cell = self._cells[coords]
+        cell.text = symbol
+        cell.color = (1, 0, 0, 1) if symbol == "X" else (0, 0, 1, 1)
+        cell.disabled = True
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_cells(self, board: Board, on_press):
+        for i in range(board.rows):
+            for j in range(board.cols):
+                cell = GameCell(i, j, font_size=32)
+                cell.bind(on_release=on_press)
+                self._cells[(i, j)] = cell
+                self.add_widget(cell)
+        self.reset(board)
+
+    @staticmethod
+    def _paint_obstacle(cell: Button):
+        cell.text = "#"
+        cell.disabled = True
+        cell.background_color = (0.7, 0.7, 0.7, 1)
+
+    @staticmethod
+    def _paint_blank(cell: Button):
+        cell.text = ""
+        cell.disabled = False
+        cell.background_color = (1, 1, 1, 1)
+        cell.color = (0, 0, 0, 1)
+
+
+# -----------------------------------------------------------------------------
+# LAYOUT / PRESENTER (implements GameObserver)
+# -----------------------------------------------------------------------------
+
+class TicTacToeLayout(BoxLayout):
+    """Presenter layer that receives a *ready* GameController via DI."""
+
     status_message = StringProperty("X's turn")
 
-    def __init__(self, **kwargs):
-        super().__init__(orientation="vertical", **kwargs)
+    def __init__(self, controller: GameController, **kw):
+        super().__init__(orientation="vertical", **kw)
+        self._controller = controller
+        self._board = controller._board  # safe: controller guarantees board attribute
 
-        # ------------------------------------------------------------------
-        # model & controller
-        # ------------------------------------------------------------------
-        self._board = Board()
-        self._controller = GameController(self._board)
+        # grid component -------------------------------------------------
+        self._grid = GameGrid(self._board, self._on_cell_pressed, size_hint=(1, 0.9))
 
-        # ------------------------------------------------------------------
-        # build grid of CellButtons
-        # ------------------------------------------------------------------
-        self._rows, self._cols = self._board.rows, self._board.cols
-        self._cells: dict[tuple[int, int], CellButton] = {}
+        # status + restart ----------------------------------------------
+        self._status = Label(text=self.status_message, size_hint=(1, 0.1))
+        self._restart = Button(text="Restart", size_hint=(1, 0.12), opacity=0, disabled=True)
+        self._restart.bind(on_release=self._on_restart)
 
-        self._grid = GridLayout(
-            rows=self._rows,
-            cols=self._cols,
-            spacing=2,
-            padding=2,
-            size_hint=(1, 0.9),
-        )
-
-        for i in range(self._rows):
-            for j in range(self._cols):
-                btn = CellButton(font_size=32, disabled=self._board.is_obstacle(i, j))
-                btn.coords = (i, j)
-                btn.bind(on_release=self._on_cell_pressed)
-
-                if self._board.is_obstacle(i, j):
-                    btn.text = "#"
-                    btn.background_color = (0.7, 0.7, 0.7, 1)
-
-                self._cells[(i, j)] = btn
-                self._grid.add_widget(btn)
-
-        # ------------------------------------------------------------------
-        # status label & restart button (hidden until round ends)
-        # ------------------------------------------------------------------
-        self._status_label = Label(text=self.status_message, size_hint=(1, 0.1))
-
-        self._restart_btn = Button(
-            text="Restart",
-            size_hint=(1, 0.12),
-            opacity=0,
-            disabled=True,
-        )
-        self._restart_btn.bind(on_release=self._on_restart)
-
-        # compose layout
+        # add widgets ----------------------------------------------------
         self.add_widget(self._grid)
-        self.add_widget(self._status_label)
-        self.add_widget(self._restart_btn)
+        self.add_widget(self._status)
+        self.add_widget(self._restart)
 
-        # ------------------------------------------------------------------
-        # register *after* widgets exist, then paint first board
-        # ------------------------------------------------------------------
+        # observe after widgets ready -----------------------------------
         self._controller.register(self)
-        self._refresh_board()
 
-    # =====================================================================
-    # UI  -> Controller
-    # =====================================================================
-    def _on_cell_pressed(self, btn: CellButton) -> None:
-        if btn.coords is not None:
-            self._controller.play(*btn.coords)
+    # ------------------------------------------------------------------
+    # UI events → controller
+    # ------------------------------------------------------------------
 
-    # =====================================================================
-    # GameObserver (Controller -> UI)  – methods required by the protocol
-    # =====================================================================
-    def on_board_change(self, coords, symbol) -> None:
-        btn = self._cells[coords]
-        btn.text = symbol
-        btn.color = (1, 0, 0, 1) if symbol == "X" else (0, 0, 1, 1)
-        btn.disabled = True
-
-    def on_state_change(self, state: GameState, next_turn) -> None:
-        if state is GameState.IN_PROGRESS:
-            self.status_message = f"{next_turn}'s turn"
-        elif state is GameState.DRAW:
-            self.status_message = "Draw!"
-            self._end_game()
-        elif state is GameState.X_WON:
-            self.status_message = "X wins!"
-            self._end_game()
-        elif state is GameState.O_WON:
-            self.status_message = "O wins!"
-            self._end_game()
-
-        self._status_label.text = self.status_message
-
-    # =====================================================================
-    # helpers
-    # =====================================================================
-    def _end_game(self) -> None:
-        """Disable all cells and reveal the Restart button."""
-        for btn in self._cells.values():
-            btn.disabled = True
-
-        # fade‑in the restart button slightly later (smooth for Kivy)        
-        Clock.schedule_once(
-            lambda _dt: (
-                setattr(self._restart_btn, "disabled", False),
-                setattr(self._restart_btn, "opacity", 1),
-            ),
-            0.3,
-        )
+    def _on_cell_pressed(self, cell: GameCell):
+        self._controller.play(*cell.coords)
 
     def _on_restart(self, *_):
-        """Callback for the Restart button – start a fresh round."""
-        self._controller.reset()   # model reset + observer notification
-        self._refresh_board()      # repaint view
+        self._controller.reset()
+        self._grid.reset(self._board)
+        self._hide_restart()
 
-        # hide the button again for the new round
-        self._restart_btn.disabled = True
-        self._restart_btn.opacity = 0
+    # ------------------------------------------------------------------
+    # GameObserver callbacks
+    # ------------------------------------------------------------------
 
-    def _refresh_board(self) -> None:
-        """Synchronise each CellButton with the Board's current state."""
-        for (i, j), btn in self._cells.items():
-            if self._board.is_obstacle(i, j):
-                btn.text = "#"
-                btn.disabled = True
-                btn.background_color = (0.7, 0.7, 0.7, 1)
-            else:
-                btn.text = ""
-                btn.disabled = False
-                btn.background_color = (1, 1, 1, 1)
-                btn.color = (0, 0, 0, 1)
+    def on_board_change(self, coords, symbol):
+        self._grid.update_cell(coords, symbol)
 
-    # =====================================================================
-    # Kivy app hook
-    # =====================================================================
+    def on_state_change(self, state: GameState, next_turn):
+        if state is GameState.IN_PROGRESS:
+            self.status_message = f"{next_turn}'s turn"
+            self._hide_restart()
+        else:
+            self.status_message = ("Draw!" if state is GameState.DRAW else f"{state.name.split('_')[0]} wins!")
+            self._end_game()
+        self._status.text = self.status_message
 
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _end_game(self):
+        Clock.schedule_once(lambda _dt: self._show_restart(), 0.3)
+
+    def _show_restart(self):
+        self._restart.disabled = False
+        self._restart.opacity = 1
+
+    def _hide_restart(self):
+        self._restart.disabled = True
+        self._restart.opacity = 0
+
+
+# -----------------------------------------------------------------------------
+# Dependency‑injection factory
+# -----------------------------------------------------------------------------
+
+def create_game() -> TicTacToeLayout:
+    """Wire Board → GameController → View and return the ready UI root."""
+    board = Board()
+    controller = GameController(board)
+    layout = TicTacToeLayout(controller)
+    return layout
+
+
+# -----------------------------------------------------------------------------
+# Kivy App entry point
+# -----------------------------------------------------------------------------
 
 class TicTacToeApp(App):
     def build(self):
-        return TicTacToeLayout()
+        return create_game()
 
 
 if __name__ == "__main__":
